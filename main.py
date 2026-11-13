@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NVIDIA next-CEO forecaster -- round-6 design.
+"""NVIDIA next-CEO forecaster -- round-6 RESERVE design (floor + parameter-free gate hard0).
 
 Implements the r6 candidate from scratch-nvidia-r6/RESEARCH_R6.md: r3 plus
 TWO changes, both inside forecast_case (everything else is r3 unchanged):
@@ -207,7 +207,7 @@ def forecast_case(case):
                 row = [x + z * lev * math.sqrt(h) for z in Z]
             else:
                 target = x * SUM_TARGET / total if total else x
-                if abs(inf['d120']) <= GATE_D120:
+                if inf['d120'] == 0:
                     med = x
                 else:
                     med = x + SUM_STRENGTH_ACTIVE * (1 - math.exp(-h / SUM_TAU)) * (target - x)
