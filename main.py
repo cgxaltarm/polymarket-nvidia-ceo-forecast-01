@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
-"""Polymarket next-CEO-of-NVIDIA forecaster — round-2 candidate (r2).
+"""Polymarket next-CEO-of-NVIDIA forecaster — round-3 candidate (r3).
 
-Design (validated in scratch-nvidia-r2, see RESEARCH_R2.md):
-* Median: persistence + horizon-grown sum-to-one pull.
-  med(h) = x + (1-exp(-h/120)) * (x/S - x),  S = sum of checkpoint prices.
-  The 24 Yes prices sum to ~1.02-1.11; the excess corrects gradually,
-  mostly out of the big markets. Full pull at long horizons (a=1.0).
-* Inner band (25%/75%): tight level-dependent normal, ADAPTIVE to recent
+Design (validated in scratch-nvidia-r3, see RESEARCH_R3.md). Builds on r2
+(scratch-nvidia-r2/main.py); the new parts are the REGIME scaling and the
+re-tuned pooling/pull parameters:
+
+* Median: persistence + horizon-grown sum-to-one pull, target sum 0.99
+  (the realised 4h sum mean-reverts to ~0.99, not 1.00).
+  med(h) = x + 1.1*(1-exp(-h/240)) * (x*0.99/S - x), S = sum of prices.
+* Inner band (25%/75%): level-dependent normal, ADAPTIVE to recent
   jumpiness: sigma = clip(robust_sigma_120m, 0.75x, 4x) * level_sigma(x),
-  where robust_sigma = sqrt(p_nonzero) * std(nonzero 1-min changes) over
-  the last 120 min, and level_sigma(x) = 0.0003 + 0.0007*clamp((x-0.01)/0.19).
-  Blended 50/50 with the POOLED empirical interquartile range (see below).
+  level_sigma(x) = 0.0004 + 0.0010*clamp((x-0.01)/0.19).
+  Blended 75/25 with the POOLED empirical interquartile range.
 * Outer band (5%/95%): per-market empirical h-change quantiles over the
-  last 12h (720 min), changes WINSORIZED at +-0.05 (kills the 11 Nov
-  listing-artefact -0.47 collapse and other one-off jumps), interpolated
-  in sqrt(h) between grid horizons, blended 50/50 with the POOLED outer:
-  changes of ALL markets normalised by level_sigma, pooled, quantiles
-  taken over the pooled sample, then re-scaled by this market's sigma.
-  Pooling borrows strength: a single market's 12h tail is noisy.
+  last 12h (720 min), changes WINSORIZED at +-0.05, interpolated in
+  sqrt(h) between grid horizons, blended 75/25 with the POOLED outer
+  (changes of ALL markets normalised by level_sigma, pooled, quantiles
+  taken over the pooled sample, then re-scaled by this market's sigma).
+  Down tail widened x1.2 (realised jumps are mostly downward).
+* REGIME scaling (new in r3): r = clip(robust_sigma_120m /
+  robust_sigma_720m, 0.5, 1.0). When the last 2h were much calmer than
+  the last 12h, spreads shrink (inner normal sigma and outer scale both
+  x r); when recent vol is at/above window vol, no change (cap 1.0).
+  This is what buys the quiet-regime gain: the 12h empirical tails are
+  too fat once the market calms down. The pooled IQR is NOT regime
+  scaled (it is already cross-market smoothed).
 * Short history (<120 prices): plain level-sigma normal for all 5 quantiles.
 
-Validated: pooled practice-6 = 0.2719 (live entry 0.3135), held-out late
-cases (13 Nov 00:00-06:00 UTC, 8 cases incl. 5 built from freshly fetched
-history) mean = 0.1213 (live entry 0.1336). FAILS the strict <=0.255 bar:
-the remaining practice loss is dominated by unpredictable persistent
-level shifts in the two jumpy cases (oracle-median analysis); no honest
-median variant tested beats persistence + sum-pull. See RESEARCH_R2.md.
+Validated (grade_entry.py + 37-case harness incl. 9 cases never used in
+selection): pooled practice-6 = 0.2655 (r2 0.2719, live 0.3135),
+held-out quiet 28 cases = 0.1120 (r2 0.1162), fresh-9 = 0.1153 (r2 0.1182),
+paired t on held = 4.12 (25/28 wins). Still short of the <=0.255 bar:
+the remaining loss is dominated by unpredictable persistent level shifts
+(oracle-median analysis, RESEARCH_R2.md section 4). See RESEARCH_R3.md.
 
 Standard library only, no network, no randomness, no wall clock:
-two runs on the same input are byte-identical. Entry v2 (nvidia-ceo-r2).
+two runs on the same input are byte-identical.
 """
 
 import json
@@ -44,8 +51,9 @@ WINDOW = 720           # last 12h of 1-minute prices for empirical outer
 POOL_WINDOW = 720      # same window for the pooled outer
 WINSOR_CAP = 0.05      # winsorize h-changes at +-0.05 before quantiles
 OUTER_SCALE = 1.0
-POOL_BLEND = 0.5       # per-market outer vs pooled outer
-POOL_INNER_BLEND = 0.5  # normal inner vs pooled empirical IQR
+O05 = 1.2              # widen the down tail (realised jumps mostly downward)
+POOL_BLEND = 0.75      # per-market outer vs pooled outer
+POOL_INNER_BLEND = 0.75  # normal inner vs pooled empirical IQR
 MIN_HISTORY = 120
 MIN_CHANGES = 20
 FORECAST_MINUTES = 240
@@ -55,9 +63,15 @@ ADAPT_WINDOW = 120
 ADAPT_LO = 0.75
 ADAPT_HI = 4.0
 
-# sum-to-one pull: strength 1.0, grows with horizon, time constant 120 min
-PULL_TAU = 120.0
-PULL_A = 1.0
+# sum-to-one pull: strength 1.1, grows with horizon, time constant 240 min,
+# target sum 0.99 (realised 4h sum mean-reverts to ~0.99, not 1.00)
+PULL_TAU = 240.0
+PULL_A = 1.1
+S_INF = 0.99
+
+# regime scaling: shrink spreads when the last 2h were much calmer than 12h
+REG_LO = 0.5
+REG_HI = 1.0
 
 
 def _clamp01(v):
@@ -75,7 +89,7 @@ def level_sigma(x):
         frac = 0.0
     elif frac > 1.0:
         frac = 1.0
-    return 0.0003 + 0.0007 * frac
+    return 0.0004 + 0.0010 * frac
 
 
 def _empirical_quantile(sorted_values, tau):
@@ -212,13 +226,19 @@ def forecast_market(prices, total_sum, pooled):
     # adaptive inner sigma from recent robust vol
     rsig = _robust_sigma(prices, ADAPT_WINDOW)
     sig = min(max(rsig, ADAPT_LO * sig0), ADAPT_HI * sig0)
+    # regime scale: recent (120m) robust vol vs window (720m) robust vol
+    rsig_w = _robust_sigma(prices, WINDOW)
+    ratio = (rsig / rsig_w) if rsig_w and rsig_w > 0 else 1.0
+    rscale = min(max(ratio, REG_LO), REG_HI)
+    sig = sig * rscale
+    oscale = OUTER_SCALE * rscale
 
     rows = []
     for minute in range(1, FORECAST_MINUTES + 1):
         root = math.sqrt(minute)
         # median: horizon-grown sum-to-one pull
         if total_sum:
-            med = x + PULL_A * (1 - math.exp(-minute / PULL_TAU)) * (x / total_sum - x)
+            med = x + PULL_A * (1 - math.exp(-minute / PULL_TAU)) * (x * S_INF / total_sum - x)
         else:
             med = x
         q05 = _interp_sqrt(lo_at, minute)
@@ -228,8 +248,8 @@ def forecast_market(prices, total_sum, pooled):
             p95 = _interp_sqrt(pool_hi_at, minute)
             q05 = (1 - POOL_BLEND) * q05 + POOL_BLEND * p05
             q95 = (1 - POOL_BLEND) * q95 + POOL_BLEND * p95
-        q05 = med + q05 * OUTER_SCALE
-        q95 = med + q95 * OUTER_SCALE
+        q05 = med + q05 * oscale * O05
+        q95 = med + q95 * oscale
         inner = 0.67449 * sig * root
         if pooled is not None:
             p25 = _interp_sqrt(pool_q25_at, minute)
