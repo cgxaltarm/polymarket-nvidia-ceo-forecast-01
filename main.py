@@ -1,171 +1,215 @@
 #!/usr/bin/env python3
-"""Two-piece quantile forecaster for Polymarket's "Next CEO of NVIDIA?" event.
+"""Polymarket next-CEO-of-NVIDIA forecaster (twopiece design).
 
-Design (validated on 13 realised cases against the house baseline):
-  * the median is persistence -- the checkpoint price, no drift, no
-    mean-reversion (both lose badly on this market);
-  * the inner quantiles (25% / 75%) are a tight normal whose sigma grows
-    with the price level (tiny markets barely move, big markets move more);
-  * the outer quantiles (5% / 95%) are the market's own empirical
-    h-minute change quantiles over the last 18 hours, interpolated in
-    sqrt(h) and shrunk by 0.9 -- wide asymmetric tails that pay exactly
-    when the rare large (mostly downward) jumps happen;
-  * markets with under 120 minutes of history fall back to the normal
-    form with a level-dependent sigma, so a newly listed market can
-    never crash the program.
+For every market we publish 240 rows (one per forecast minute) of five
+quantiles [0.05, 0.25, 0.5, 0.75, 0.95] for the Yes price.
 
-Pure standard library, deterministic (no randomness, no clock, no
-network), one forecast file per input case.
+Shape of the forecast
+----------------------
+* The median is persistence: the last observed price, no drift and no
+  pull back toward any mean.
+* The inner band (25% / 75%) is a tight Gaussian around that median,
+  with a spread that grows with the price level: tiny markets barely
+  move, the big favourites get more room.
+* The outer band (5% / 95%) is empirical and asymmetric: for each grid
+  horizon we look at what h-minute moves actually did over the last
+  18 hours of that market, take the 5th / 95th percentile of those
+  moves, and interpolate between horizons in sqrt(h). Rare large
+  (mostly downward) jumps are therefore priced in without widening
+  the quiet-minute inner band.
+* A market with little history falls back to the Gaussian form for
+  all five quantiles, so a newly listed market can never crash us.
+
+Standard library only, no network, no randomness, no wall clock:
+two runs on the same input are byte-identical.
 """
 
 import json
 import math
 import os
+import sys
 
-# Horizons (minutes) at which empirical change quantiles are tabulated.
-GRID = (1, 2, 4, 8, 16, 32, 64, 120, 240)
-# Last 18 hours of 1-minute prices: 1080 minutes plus the endpoint.
-WINDOW = 1081
-# Outer (5% / 95%) quantiles are shrunk toward the median by this factor.
-OUTER_SCALE = 0.9
-# Below this many prices the empirical tails are not trusted.
-SHORT_HISTORY = 120
-# Standard-normal quantiles at the 5% and 25% levels.
-Z95 = 1.644854
-Z75 = 0.674490
+# Normal quantiles for the five levels we emit, in order.
+Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
+STANDARD_TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
+
+# Horizons (minutes) at which empirical move distributions are measured.
+GRID_HORIZONS = (1, 2, 4, 8, 16, 32, 64, 120, 240)
+
+WINDOW = 1081          # last 18h of 1-minute prices (1080 steps + endpoint)
+MIN_HISTORY = 120      # below this, the empirical tails are not trusted
+MIN_CHANGES = 20       # below this, a horizon falls back to scaled 1-min moves
+OUTER_SCALE = 0.9      # shrink on the empirical outer quantiles
+FORECAST_MINUTES = 240
 
 
-def clamp01(value):
-    """Clamp a price to the unit interval."""
-    if value < 0.0:
+def _clamp01(v):
+    if v < 0.0:
         return 0.0
-    if value > 1.0:
+    if v > 1.0:
         return 1.0
-    return value
-
-
-def round6(value):
-    """Clamp to [0, 1] and round to 6 decimals (never -0.0)."""
-    return round(clamp01(value) * 1000000) / 1000000 + 0.0
+    return v
 
 
 def level_sigma(x):
-    """Inner normal sigma for a market priced at x.
-
-    0.0003 for x <= 0.01, rising linearly to 0.0010 for x >= 0.20.
-    """
-    t = (x - 0.01) / 0.19
-    if t < 0.0:
-        t = 0.0
-    elif t > 1.0:
-        t = 1.0
-    return 0.0003 + 0.0007 * t
+    """Gaussian spread per sqrt(minute), growing with the price level."""
+    frac = (x - 0.01) / 0.19
+    if frac < 0.0:
+        frac = 0.0
+    elif frac > 1.0:
+        frac = 1.0
+    return 0.0003 + 0.0007 * frac
 
 
-def _quantile(sorted_values, tau):
-    """Linear-interpolation quantile of an already-sorted list."""
+def _empirical_quantile(sorted_values, tau):
+    """Linear-interpolation quantile of an already sorted list."""
     n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_values[0]
     pos = tau * (n - 1)
     lo = int(math.floor(pos))
-    hi = lo + 1 if lo + 1 < n else n - 1
-    frac = pos - lo
-    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return sorted_values[lo]
+    weight = pos - lo
+    return sorted_values[lo] + weight * (sorted_values[hi] - sorted_values[lo])
 
 
-def _changes(series, horizon):
-    """All h-minute changes of a price series, oldest first."""
-    return [series[i + horizon] - series[i]
-            for i in range(len(series) - horizon)]
+def _changes(series, step):
+    return [series[i + step] - series[i] for i in range(len(series) - step)]
 
 
 def _outer_band(series):
-    """Per-grid-horizon (5%, 95%) empirical change quantiles.
+    """Return (low, high) lists: empirical 5%/95% moves per grid horizon.
 
-    A horizon with fewer than 20 changes borrows the 1-minute changes
-    scaled by that horizon instead of trusting a tiny sample.
+    Each list is aligned with GRID_HORIZONS. A horizon with too few
+    observed moves borrows the 1-minute move distribution, scaled by
+    the horizon length.
     """
-    one_minute = _changes(series, 1)
-    band = {}
-    for horizon in GRID:
-        changes = _changes(series, horizon)
-        if len(changes) < 20:
-            changes = [c * horizon for c in one_minute] if one_minute else [0.0]
-        ordered = sorted(changes)
-        band[horizon] = (_quantile(ordered, 0.05) * OUTER_SCALE,
-                         _quantile(ordered, 0.95) * OUTER_SCALE)
-    return band
+    one_min = _changes(series, 1)
+    one_min_sorted = sorted(one_min)
+    low_at = []
+    high_at = []
+    for h in GRID_HORIZONS:
+        moves = _changes(series, h)
+        if len(moves) < MIN_CHANGES:
+            lo = _empirical_quantile(one_min_sorted, 0.05) * h
+            hi = _empirical_quantile(one_min_sorted, 0.95) * h
+        else:
+            ordered = sorted(moves)
+            lo = _empirical_quantile(ordered, 0.05)
+            hi = _empirical_quantile(ordered, 0.95)
+        low_at.append(lo)
+        high_at.append(hi)
+    return low_at, high_at
 
 
-def _normal_rows(x, sigma, horizon):
-    """Plain symmetric-normal quantiles around x (fallback shape)."""
+def _interp_sqrt(grid_values, minute):
+    """Interpolate a grid-horizon series at `minute`, linear in sqrt(h)."""
+    target = math.sqrt(minute)
+    roots = [math.sqrt(h) for h in GRID_HORIZONS]
+    if target <= roots[0]:
+        return grid_values[0]
+    if target >= roots[-1]:
+        return grid_values[-1]
+    for k in range(len(roots) - 1):
+        if roots[k] <= target <= roots[k + 1]:
+            span = roots[k + 1] - roots[k]
+            frac = (target - roots[k]) / span if span else 0.0
+            return grid_values[k] + frac * (grid_values[k + 1] - grid_values[k])
+    return grid_values[-1]
+
+
+def _tidy(row):
+    """Clamp to [0, 1], round to 6 decimals, force non-decreasing."""
+    out = []
+    prev = 0.0
+    for v in row:
+        v = round(_clamp01(v), 6) + 0.0
+        if v < prev:
+            v = prev
+        out.append(v)
+        prev = v
+    return out
+
+
+def _gaussian_rows(x, sigma):
+    """All five quantiles from the normal form around x."""
     rows = []
-    for minute in range(1, horizon + 1):
-        spread = math.sqrt(minute)
-        rows.append([round6(x - Z95 * sigma * spread),
-                     round6(x - Z75 * sigma * spread),
-                     round6(x),
-                     round6(x + Z75 * sigma * spread),
-                     round6(x + Z95 * sigma * spread)])
+    for minute in range(1, FORECAST_MINUTES + 1):
+        spread = sigma * math.sqrt(minute)
+        rows.append(_tidy([x + z * spread for z in Z_SCORES]))
     return rows
 
 
-def forecast_market(prices, horizon=240):
-    """Forecast one market: 240 rows of [q05, q25, q50, q75, q95]."""
+def forecast_market(prices):
+    """240 x 5 quantile rows for one market's price history."""
     if not prices:
-        return [[0.5] * 5 for _ in range(horizon)]
+        x = 0.5
+        return _gaussian_rows(x, 0.001)
     x = prices[-1]
     if len(prices) < 2:
-        return _normal_rows(x, 0.001, horizon)
-    if len(prices) < SHORT_HISTORY:
-        return _normal_rows(x, level_sigma(x), horizon)
+        return _gaussian_rows(x, 0.001)
+    if len(prices) < MIN_HISTORY:
+        return _gaussian_rows(x, level_sigma(x))
 
-    band = _outer_band(prices[-WINDOW:])
+    recent = prices[-WINDOW:]
+    low_at, high_at = _outer_band(recent)
     sigma = level_sigma(x)
-    roots = {h: math.sqrt(h) for h in GRID}
     rows = []
-    for minute in range(1, horizon + 1):
-        spread = math.sqrt(minute)
-        below = max(g for g in GRID if g <= minute)
-        above = min(g for g in GRID if g >= minute)
-        if below == above:
-            low, high = band[below]
-        else:
-            weight = (spread - roots[below]) / (roots[above] - roots[below])
-            low = band[below][0] * (1.0 - weight) + band[above][0] * weight
-            high = band[below][1] * (1.0 - weight) + band[above][1] * weight
-        inner = Z75 * sigma * spread
-        row = [round6(x + low),
-               round6(x - inner),
-               round6(x),
-               round6(x + inner),
-               round6(x + high)]
-        # Rows must be non-decreasing; an all-rising window can put the
-        # empirical 5% quantile above the tight 25% one, so repair it.
-        for j in range(1, 5):
-            if row[j] < row[j - 1]:
-                row[j] = row[j - 1]
-        rows.append(row)
+    for minute in range(1, FORECAST_MINUTES + 1):
+        root = math.sqrt(minute)
+        q05 = x + _interp_sqrt(low_at, minute) * OUTER_SCALE
+        q95 = x + _interp_sqrt(high_at, minute) * OUTER_SCALE
+        inner = 0.674490 * sigma * root
+        rows.append(_tidy([q05, x - inner, x, x + inner, q95]))
     return rows
+
+
+def _reorder(rows, requested_taus):
+    """Emit rows in the case's quantile order (kit guarantees standard)."""
+    if not requested_taus:
+        return rows
+    order = []
+    for tau in requested_taus:
+        best = min(range(len(STANDARD_TAUS)),
+                   key=lambda i: abs(STANDARD_TAUS[i] - tau))
+        order.append(best)
+    if order == list(range(len(STANDARD_TAUS))):
+        return rows
+    return [[row[i] for i in order] for row in rows]
+
+
+def process_case(case):
+    markets = case.get("markets") or []
+    requested = case.get("quantiles") or list(STANDARD_TAUS)
+    forecasts = []
+    for market in markets:
+        prices = market.get("prices") or []
+        rows = forecast_market([float(p) for p in prices])
+        forecasts.append({
+            "id": market.get("id"),
+            "q": _reorder(rows, requested),
+        })
+    return {"forecasts": forecasts}
 
 
 def main():
-    in_dir = os.environ.get('MAKEFUN_INPUT_DIR') or '/input'
-    out_dir = os.environ.get('MAKEFUN_OUTPUT_DIR') or '/output'
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
     os.makedirs(out_dir, exist_ok=True)
-    for name in sorted(os.listdir(in_dir)):
-        if not name.endswith('.in'):
-            continue
-        with open(os.path.join(in_dir, name), encoding='utf-8') as handle:
-            case = json.load(handle)
-        horizon = int(case.get('horizon_minutes', 240))
-        forecasts = [{'id': market['id'],
-                      'q': forecast_market(market['prices'], horizon)}
-                     for market in case['markets']]
-        out_name = name[:-3] + '.out'
-        with open(os.path.join(out_dir, out_name), 'w', encoding='utf-8') as handle:
-            json.dump({'forecasts': forecasts}, handle, separators=(',', ':'))
-            handle.write('\n')
+    names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
+    for name in names:
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
+            case = json.load(fh)
+        result = process_case(case)
+        out_name = name[:-3] + ".out"
+        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(result, separators=(",", ":")) + "\n")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
