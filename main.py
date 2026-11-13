@@ -11,7 +11,8 @@ Design (validated on 13 realised cases against the house baseline):
     sqrt(h) and shrunk by 0.9 -- wide asymmetric tails that pay exactly
     when the rare large (mostly downward) jumps happen;
   * markets with under 120 minutes of history fall back to the normal
-    form, so a newly listed market can never crash the program.
+    form with a level-dependent sigma, so a newly listed market can
+    never crash the program.
 
 Pure standard library, deterministic (no randomness, no clock, no
 network), one forecast file per input case.
