@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Polymarket next-CEO-of-NVIDIA forecaster (twopiece design).
+"""Polymarket next-CEO-of-NVIDIA forecaster — round-2 candidate (r2).
 
-For every market we publish 240 rows (one per forecast minute) of five
-quantiles [0.05, 0.25, 0.5, 0.75, 0.95] for the Yes price.
+Design (validated in scratch-nvidia-r2, see RESEARCH_R2.md):
+* Median: persistence + horizon-grown sum-to-one pull.
+  med(h) = x + (1-exp(-h/120)) * (x/S - x),  S = sum of checkpoint prices.
+  The 24 Yes prices sum to ~1.02-1.11; the excess corrects gradually,
+  mostly out of the big markets. Full pull at long horizons (a=1.0).
+* Inner band (25%/75%): tight level-dependent normal, ADAPTIVE to recent
+  jumpiness: sigma = clip(robust_sigma_120m, 0.75x, 4x) * level_sigma(x),
+  where robust_sigma = sqrt(p_nonzero) * std(nonzero 1-min changes) over
+  the last 120 min, and level_sigma(x) = 0.0003 + 0.0007*clamp((x-0.01)/0.19).
+  Blended 50/50 with the POOLED empirical interquartile range (see below).
+* Outer band (5%/95%): per-market empirical h-change quantiles over the
+  last 12h (720 min), changes WINSORIZED at +-0.05 (kills the 11 Nov
+  listing-artefact -0.47 collapse and other one-off jumps), interpolated
+  in sqrt(h) between grid horizons, blended 50/50 with the POOLED outer:
+  changes of ALL markets normalised by level_sigma, pooled, quantiles
+  taken over the pooled sample, then re-scaled by this market's sigma.
+  Pooling borrows strength: a single market's 12h tail is noisy.
+* Short history (<120 prices): plain level-sigma normal for all 5 quantiles.
 
-Shape of the forecast
-----------------------
-* The median is persistence: the last observed price, no drift and no
-  pull back toward any mean.
-* The inner band (25% / 75%) is a tight Gaussian around that median,
-  with a spread that grows with the price level: tiny markets barely
-  move, the big favourites get more room.
-* The outer band (5% / 95%) is empirical and asymmetric: for each grid
-  horizon we look at what h-minute moves actually did over the last
-  18 hours of that market, take the 5th / 95th percentile of those
-  moves, and interpolate between horizons in sqrt(h). Rare large
-  (mostly downward) jumps are therefore priced in without widening
-  the quiet-minute inner band.
-* A market with little history falls back to the Gaussian form for
-  all five quantiles, so a newly listed market can never crash us.
+Validated: pooled practice-6 = 0.2719 (live entry 0.3135), held-out late
+cases (13 Nov 00:00-06:00 UTC, 8 cases incl. 5 built from freshly fetched
+history) mean = 0.1213 (live entry 0.1336). FAILS the strict <=0.255 bar:
+the remaining practice loss is dominated by unpredictable persistent
+level shifts in the two jumpy cases (oracle-median analysis); no honest
+median variant tested beats persistence + sum-pull. See RESEARCH_R2.md.
 
 Standard library only, no network, no randomness, no wall clock:
 two runs on the same input are byte-identical.
@@ -29,18 +36,28 @@ import math
 import os
 import sys
 
-# Normal quantiles for the five levels we emit, in order.
 Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
 STANDARD_TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
-
-# Horizons (minutes) at which empirical move distributions are measured.
 GRID_HORIZONS = (1, 2, 4, 8, 16, 32, 64, 120, 240)
 
-WINDOW = 1081          # last 18h of 1-minute prices (1080 steps + endpoint)
-MIN_HISTORY = 120      # below this, the empirical tails are not trusted
-MIN_CHANGES = 20       # below this, a horizon falls back to scaled 1-min moves
-OUTER_SCALE = 0.9      # shrink on the empirical outer quantiles
+WINDOW = 720           # last 12h of 1-minute prices for empirical outer
+POOL_WINDOW = 720      # same window for the pooled outer
+WINSOR_CAP = 0.05      # winsorize h-changes at +-0.05 before quantiles
+OUTER_SCALE = 1.0
+POOL_BLEND = 0.5       # per-market outer vs pooled outer
+POOL_INNER_BLEND = 0.5  # normal inner vs pooled empirical IQR
+MIN_HISTORY = 120
+MIN_CHANGES = 20
 FORECAST_MINUTES = 240
+
+# adaptive inner sigma (robust 120-min vol, clipped to a multiple of level sigma)
+ADAPT_WINDOW = 120
+ADAPT_LO = 0.75
+ADAPT_HI = 4.0
+
+# sum-to-one pull: strength 1.0, grows with horizon, time constant 120 min
+PULL_TAU = 120.0
+PULL_A = 1.0
 
 
 def _clamp01(v):
@@ -81,32 +98,6 @@ def _changes(series, step):
     return [series[i + step] - series[i] for i in range(len(series) - step)]
 
 
-def _outer_band(series):
-    """Return (low, high) lists: empirical 5%/95% moves per grid horizon.
-
-    Each list is aligned with GRID_HORIZONS. A horizon with too few
-    observed moves borrows the 1-minute move distribution, scaled
-    linearly by the horizon length (times h, not sqrt(h)) — a
-    deliberately conservative over-scaling for thin horizons.
-    """
-    one_min = _changes(series, 1)
-    one_min_sorted = sorted(one_min)
-    low_at = []
-    high_at = []
-    for h in GRID_HORIZONS:
-        moves = _changes(series, h)
-        if len(moves) < MIN_CHANGES:
-            lo = _empirical_quantile(one_min_sorted, 0.05) * h
-            hi = _empirical_quantile(one_min_sorted, 0.95) * h
-        else:
-            ordered = sorted(moves)
-            lo = _empirical_quantile(ordered, 0.05)
-            hi = _empirical_quantile(ordered, 0.95)
-        low_at.append(lo)
-        high_at.append(hi)
-    return low_at, high_at
-
-
 def _interp_sqrt(grid_values, minute):
     """Interpolate a grid-horizon series at `minute`, linear in sqrt(h)."""
     target = math.sqrt(minute)
@@ -145,27 +136,109 @@ def _gaussian_rows(x, sigma):
     return rows
 
 
-def forecast_market(prices):
+def _robust_sigma(prices, window):
+    """Jump-robust 1-min vol: sqrt(p_nonzero) * std(nonzero changes)."""
+    seg = prices[-window - 1:] if len(prices) > window + 1 else prices
+    diffs = [seg[i + 1] - seg[i] for i in range(len(seg) - 1)]
+    nz = [v for v in diffs if v != 0]
+    if len(nz) < 10:
+        return 0.0003
+    p = len(nz) / len(diffs)
+    m = sum(nz) / len(nz)
+    var = sum((v - m) ** 2 for v in nz) / (len(nz) - 1)
+    return math.sqrt(p) * math.sqrt(var)
+
+
+def _quantile_grid(series, taus):
+    """Per-grid-horizon empirical quantiles of h-changes (winsorized)."""
+    one_min = _changes(series, 1)
+    out = []
+    for h in GRID_HORIZONS:
+        moves = _changes(series, h)
+        if len(moves) < MIN_CHANGES:
+            moves = [c * h for c in one_min]
+        moves = [max(-WINSOR_CAP, min(WINSOR_CAP, c)) for c in moves]
+        ordered = sorted(moves)
+        out.append([_empirical_quantile(ordered, t) for t in taus])
+    return out
+
+
+def _pooled_quantile_grid(all_prices):
+    """Cross-market pooled quantiles of level-normalised h-changes.
+
+    For each market, take its last POOL_WINDOW minutes, divide each
+    h-change by that market's level_sigma, pool across markets, and take
+    the five quantiles. Returns {h: [q05, q25, q50, q75, q95]} in
+    normalised units (multiply by a market's level_sigma to use).
+    """
+    pooled = {}
+    for h in GRID_HORIZONS:
+        norm = []
+        for prices in all_prices:
+            seg = prices[-POOL_WINDOW - 1:] if len(prices) > POOL_WINDOW + 1 else prices
+            sig = level_sigma(prices[-1]) if prices else 0.0003
+            moves = _changes(seg, h)
+            if len(moves) < MIN_CHANGES:
+                moves = [c * h for c in _changes(seg, 1)]
+            for c in moves:
+                norm.append(max(-WINSOR_CAP, min(WINSOR_CAP, c)) / sig)
+        ordered = sorted(norm)
+        pooled[h] = [_empirical_quantile(ordered, t) for t in STANDARD_TAUS]
+    return pooled
+
+
+def forecast_market(prices, total_sum, pooled):
     """240 x 5 quantile rows for one market's price history."""
     if not prices:
-        x = 0.5
-        return _gaussian_rows(x, 0.001)
+        return _gaussian_rows(0.5, 0.001)
     x = prices[-1]
     if len(prices) < 2:
         return _gaussian_rows(x, 0.001)
     if len(prices) < MIN_HISTORY:
         return _gaussian_rows(x, level_sigma(x))
 
-    recent = prices[-WINDOW:]
-    low_at, high_at = _outer_band(recent)
-    sigma = level_sigma(x)
+    seg = prices[-WINDOW - 1:] if len(prices) > WINDOW + 1 else prices
+    q_grid = _quantile_grid(seg, STANDARD_TAUS)  # per grid h: 5 quantiles
+    lo_at = [q[0] for q in q_grid]
+    hi_at = [q[4] for q in q_grid]
+
+    # pooled outer/inner, in normalised units -> scale by this market's sigma
+    sig0 = level_sigma(x)
+    pool_lo_at = [pooled[h][0] * sig0 for h in GRID_HORIZONS]
+    pool_hi_at = [pooled[h][4] * sig0 for h in GRID_HORIZONS]
+    pool_q25_at = [pooled[h][1] * sig0 for h in GRID_HORIZONS]
+    pool_q75_at = [pooled[h][3] * sig0 for h in GRID_HORIZONS]
+
+    # adaptive inner sigma from recent robust vol
+    rsig = _robust_sigma(prices, ADAPT_WINDOW)
+    sig = min(max(rsig, ADAPT_LO * sig0), ADAPT_HI * sig0)
+
     rows = []
     for minute in range(1, FORECAST_MINUTES + 1):
         root = math.sqrt(minute)
-        q05 = x + _interp_sqrt(low_at, minute) * OUTER_SCALE
-        q95 = x + _interp_sqrt(high_at, minute) * OUTER_SCALE
-        inner = 0.674490 * sigma * root
-        rows.append(_tidy([q05, x - inner, x, x + inner, q95]))
+        # median: horizon-grown sum-to-one pull
+        if total_sum:
+            med = x + PULL_A * (1 - math.exp(-minute / PULL_TAU)) * (x / total_sum - x)
+        else:
+            med = x
+        q05 = _interp_sqrt(lo_at, minute)
+        q95 = _interp_sqrt(hi_at, minute)
+        if pooled is not None:
+            p05 = _interp_sqrt(pool_lo_at, minute)
+            p95 = _interp_sqrt(pool_hi_at, minute)
+            q05 = (1 - POOL_BLEND) * q05 + POOL_BLEND * p05
+            q95 = (1 - POOL_BLEND) * q95 + POOL_BLEND * p95
+        q05 = med + q05 * OUTER_SCALE
+        q95 = med + q95 * OUTER_SCALE
+        inner = 0.67449 * sig * root
+        if pooled is not None:
+            p25 = _interp_sqrt(pool_q25_at, minute)
+            p75 = _interp_sqrt(pool_q75_at, minute)
+            inner_lo = (1 - POOL_INNER_BLEND) * inner + POOL_INNER_BLEND * (-p25)
+            inner_hi = (1 - POOL_INNER_BLEND) * inner + POOL_INNER_BLEND * p75
+        else:
+            inner_lo = inner_hi = inner
+        rows.append(_tidy([q05, med - inner_lo, med, med + inner_hi, q95]))
     return rows
 
 
@@ -186,10 +259,12 @@ def _reorder(rows, requested_taus):
 def process_case(case):
     markets = case.get("markets") or []
     requested = case.get("quantiles") or list(STANDARD_TAUS)
+    all_prices = [[float(p) for p in (m.get("prices") or [])] for m in markets]
+    total_sum = sum(pr[-1] for pr in all_prices if pr)
+    pooled = _pooled_quantile_grid(all_prices) if len(markets) > 1 else None
     forecasts = []
-    for market in markets:
-        prices = market.get("prices") or []
-        rows = forecast_market([float(p) for p in prices])
+    for market, prices in zip(markets, all_prices):
+        rows = forecast_market(prices, total_sum, pooled)
         forecasts.append({
             "id": market.get("id"),
             "q": _reorder(rows, requested),
