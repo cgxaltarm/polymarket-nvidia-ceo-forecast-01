@@ -85,8 +85,9 @@ def _outer_band(series):
     """Return (low, high) lists: empirical 5%/95% moves per grid horizon.
 
     Each list is aligned with GRID_HORIZONS. A horizon with too few
-    observed moves borrows the 1-minute move distribution, scaled by
-    the horizon length.
+    observed moves borrows the 1-minute move distribution, scaled
+    linearly by the horizon length (times h, not sqrt(h)) — a
+    deliberately conservative over-scaling for thin horizons.
     """
     one_min = _changes(series, 1)
     one_min_sorted = sorted(one_min)
