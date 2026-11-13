@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
-"""NVIDIA next-CEO forecaster -- round-3 design.
-Third revision of the NVIDIA chief-executive succession model.
+"""NVIDIA next-CEO forecaster -- round-4 design.
+Fourth revision of the NVIDIA chief-executive succession model.
 
-Implements the r3 candidate described in RESEARCH_R3.md section 2, built on
-the r2 base design in RESEARCH_R2.md section 3:
+Implements the r4 candidate from scratch-nvidia-r4/RESEARCH_R4.md: r3 plus
+ONE change -- the sum-to-one pull is ASYMMETRIC (Ide 1).  The pull-down
+strength (target < x, sum too high) is 0.7 and the pull-up strength
+(target > x) is 0.4, fit on the 37-case harness (see eval_r4.py):
 
-* Median: persistence pulled toward the sum-to-one target.  The pull is
-  horizon-grown, tau 240, strength 1.1, target sum 0.99:
-      med(h) = x + 1.1 * (1 - exp(-h/240)) * (x * 0.99 / S - x)
-  where x is the checkpoint price and S is the sum of checkpoint prices
-  over all markets in the case.
-* Inner quantiles (25% / 75%): a tight normal centred on the median, with a
-  level-dependent sigma adapted by the robust 120-min volatility
-  (clipped to [0.75x, 4x] the level sigma), blended 75/25 with the pooled
-  empirical inner quantiles (the pooled distribution's own q25/q75,
-  normalised by level sigma and re-scaled).  The normal half-width is
-  scaled by the regime factor r; the pooled part is not.
-* Outer quantiles (5% / 95%): per-market empirical quantiles of h-minute
-  price changes over the last 12h, winsorised to +/-0.05, blended 75/25
-  with the cross-market pooled outer (changes normalised by level sigma,
-  pooled over all markets, re-scaled).  The blended outer is scaled by
-  the regime factor r, and the down tail (q05) is widened by 1.2.
-* Regime factor: r = clip(rsig120 / rsig720, 0.5, 1.0), where rsig is the
-  robust 1-min volatility sqrt(p_nonzero) * std(nonzero diffs) (floor
-  0.0003 when fewer than 10 nonzero diffs).  Quiet now -> shrink; jumpy
-  now -> keep (never widen above 1.0).
-* Level sigma: 0.0004 + 0.0010 * clamp((x - 0.01) / 0.19, 0, 1).
-* Empirical quantiles are computed on the grid horizons
-  [1, 2, 4, 8, 16, 32, 64, 120, 240] and interpolated in sqrt(h).
-* Short history (< 120 prices): level-sigma normal fallback for all five
-  quantiles, median = last price (no sum-pull).
+* Median: med(h) = x + A * (1 - exp(-h/240)) * (x * 0.99 / S - x),
+  A = 0.7 when the market is pulled DOWN, 0.4 when pulled UP.
+* Everything else is r3 unchanged: inner quantiles (level sigma adapted by
+  robust 120-min vol, blended 75/25 with the pooled empirical inner),
+  outer quantiles (per-market empirical + pooled blend 75/25, regime factor
+  r = clip(rsig120/rsig720, 0.5, 1.0), down tail widened 1.2x), short
+  history (< 120 prices) level-sigma normal fallback.
 
-Stdlib only, deterministic: no randomness, no wall-clock, no network.
-Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
-(else /output), one .out per .in, JSON {"forecasts": [...]}.
+REJECTED in r4 (tested, loses on held-28 AND fresh-9, see eval_r4.py):
+logit-space outer quantiles (Ide 2) -- the up tail maps 2.19x too wide in
+price space for small markets; every logit variant scores +0.004..+0.019
+worse than r3.  Bounce/give-back (Ide 3) was already proven dead in
+RESEARCH_R4.md section 3a/3b and was NOT built.
+
+Validated (fast harness eval_r4.py, 37 cases; standalone grade to confirm):
+r4 (Ad=0.7, Au=0.4) pooled-6 0.266612, held-28 0.111770, fresh-9 0.114758
+vs r3 pooled-6 0.265358, held-28 0.111951, fresh-9 0.115096.
+Gate (held AND fresh beat r3) passes narrowly; pooled-6 is WORSE, so the
+live leaderboard score would likely DROP -- see REPORT_R4.md before
+deciding on jury/submit.
 """
 
 import json
@@ -54,7 +47,8 @@ WINSOR = 0.05
 POOL_B = 0.75        # pooled weight for the outer quantiles
 POOL_INNER = 0.75    # pooled weight for the inner quantiles
 SUM_TAU = 240.0
-SUM_STRENGTH = 1.1
+SUM_STRENGTH_DOWN = 0.7  # r4: pull toward target when target < x (sum too high)
+SUM_STRENGTH_UP = 0.4    # r4: pull toward target when target > x
 SUM_TARGET = 0.99
 OUTER_Q05_SCALE = 1.2
 REGIME_LO = 0.5
@@ -194,7 +188,8 @@ def forecast_case(case):
                 row = [x + z * lev * math.sqrt(h) for z in Z]
             else:
                 target = x * SUM_TARGET / total if total else x
-                med = x + SUM_STRENGTH * (1 - math.exp(-h / SUM_TAU)) * (target - x)
+                a = SUM_STRENGTH_DOWN if target < x else SUM_STRENGTH_UP
+                med = x + a * (1 - math.exp(-h / SUM_TAU)) * (target - x)
                 own_q = interp_grid(inf['own'], h)
                 pool_q = interp_grid(pooled, h)
                 pool_o05 = pool_q[0] * lev
