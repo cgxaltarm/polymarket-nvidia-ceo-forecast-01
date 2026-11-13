@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """NVIDIA next-CEO forecaster -- round-3 design.
+Third revision of the NVIDIA chief-executive succession model.
 
 Implements the r3 candidate described in RESEARCH_R3.md section 2, built on
 the r2 base design in RESEARCH_R2.md section 3:
