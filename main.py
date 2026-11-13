@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
-"""NVIDIA next-CEO forecaster -- round-4 design.
-Fourth revision of the NVIDIA chief-executive succession model.
+"""NVIDIA next-CEO forecaster -- round-5 design.
 
-Implements the r4 candidate from scratch-nvidia-r4/RESEARCH_R4.md: r3 plus
-ONE change -- the sum-to-one pull is ASYMMETRIC (Ide 1).  The pull-down
-strength (target < x, sum too high) is 0.7 and the pull-up strength
-(target > x) is 0.4, fit on the 37-case harness (see eval_r4.py):
+Implements the r5 candidate from scratch-nvidia-r5/RESEARCH_R5.md: r3 plus
+TWO changes, both inside forecast_case (everything else is r3 unchanged):
 
-* Median: med(h) = x + A * (1 - exp(-h/240)) * (x * 0.99 / S - x),
-  A = 0.7 when the market is pulled DOWN, 0.4 when pulled UP.
-* Everything else is r3 unchanged: inner quantiles (level sigma adapted by
-  robust 120-min vol, blended 75/25 with the pooled empirical inner),
-  outer quantiles (per-market empirical + pooled blend 75/25, regime factor
-  r = clip(rsig120/rsig720, 0.5, 1.0), down tail widened 1.2x), short
-  history (< 120 prices) level-sigma normal fallback.
+* Activity-gated sum-pull (Claude R1; D4 diagnostic): the r3 pull toward
+  the sum-to-one target only lives in markets that recently moved.  In
+  quiet markets the pull slope is ~0 pooled, so pulling them is wrong.
+      d120 = prices[-1] - prices[-121] (or prices[-1] - prices[0] if <121)
+      |d120| <= 0.0035  ->  med(h) = x  (no pull, any h)
+      active            ->  med(h) = x + 1.234 * (1 - exp(-h/240))
+                                  * (x * 0.99 / S - x)
+  1.234 = tercile-2 slope (0.78) / (1 - exp(-1)).  S is the sum of last
+  prices over all markets (NO reallocation -- reallocation variants were
+  tested and are weaker combined with this gate).
+* Zero-atom collapse (Z-all): a market with <= 1 nonzero 1-minute change
+  in the last 720 minutes is dormant -- ALL five quantiles equal the
+  median for every h (q05 = q25 = q50 = q75 = q95 = med).
 
-REJECTED in r4 (tested, loses on held-28 AND fresh-9, see eval_r4.py):
-logit-space outer quantiles (Ide 2) -- the up tail maps 2.19x too wide in
-price space for small markets; every logit variant scores +0.004..+0.019
-worse than r3.  Bounce/give-back (Ide 3) was already proven dead in
-RESEARCH_R4.md section 3a/3b and was NOT built.
+Unchanged from r3: inner quantiles (level sigma adapted by robust 120-min
+vol, blended 75/25 with the pooled empirical inner), outer quantiles
+(per-market empirical + pooled blend 75/25, regime factor
+r = clip(rsig120/rsig720, 0.5, 1.0), down tail widened 1.2x), short
+history (< 120 prices) level-sigma normal fallback (no gate, no collapse).
 
-Validated (fast harness eval_r4.py, 37 cases; standalone grade to confirm):
-r4 (Ad=0.7, Au=0.4) pooled-6 0.266612, held-28 0.111770, fresh-9 0.114758
+Validated (fast harness eval_r5b.py, 37 cases; standalone grade to confirm):
+r5 pooled-6 0.262740, held-28 0.111369, fresh-9 0.114466
 vs r3 pooled-6 0.265358, held-28 0.111951, fresh-9 0.115096.
-Gate (held AND fresh beat r3) passes narrowly; pooled-6 is WORSE, so the
-live leaderboard score would likely DROP -- see REPORT_R4.md before
-deciding on jury/submit.
+Paired vs r3: held 22/28 wins (t=-3.49), fresh 6/9 (t=-2.46).
+Reserve candidate (G hard0 + Z-all, gate |d120| == 0, scale 1.1):
+pooled-6 0.265035, held-28 0.111443, fresh-9 0.114183.
 """
 
 import json
@@ -47,8 +50,8 @@ WINSOR = 0.05
 POOL_B = 0.75        # pooled weight for the outer quantiles
 POOL_INNER = 0.75    # pooled weight for the inner quantiles
 SUM_TAU = 240.0
-SUM_STRENGTH_DOWN = 0.7  # r4: pull toward target when target < x (sum too high)
-SUM_STRENGTH_UP = 0.4    # r4: pull toward target when target > x
+GATE_D120 = 0.0035    # r5: |d120| <= this -> market quiet, no sum-pull
+SUM_STRENGTH_ACTIVE = 1.234  # r5: pull strength for active markets only
 SUM_TARGET = 0.99
 OUTER_Q05_SCALE = 1.2
 REGIME_LO = 0.5
@@ -139,7 +142,8 @@ def forecast_case(case):
         pr = m.get('prices') or []
         if not pr:
             info.append({'m': m, 'pr': [], 'x': 0.0, 'level': LEVEL_S0,
-                         'adapt': LEVEL_S0, 'r': 1.0, 'own': None})
+                         'adapt': LEVEL_S0, 'r': 1.0, 'own': None,
+                         'd120': 0.0, 'dormant': False})
             continue
         x = pr[-1]
         lev = level_sigma(x)
@@ -150,8 +154,13 @@ def forecast_case(case):
         adapt = min(ADAPT_HI * lev, max(ADAPT_LO * lev, rs120))
         seg = pr[-(OUTER_WINDOW + 1):] if len(pr) > OUTER_WINDOW + 1 else pr
         own = {h: empirical_quantiles(seg, h) for h in GRID_H}
+        # r5: activity gate + dormancy (same segment as the harness: last 721
+        # prices, i.e. 720 one-minute changes).
+        d120 = pr[-1] - pr[-121] if len(pr) > 120 else pr[-1] - pr[0]
+        nj = sum(1 for i in range(len(seg) - 1) if seg[i + 1] != seg[i])
         info.append({'m': m, 'pr': pr, 'x': x, 'level': lev,
-                     'adapt': adapt, 'r': r, 'own': own})
+                     'adapt': adapt, 'r': r, 'own': own,
+                     'd120': d120, 'dormant': nj <= 1})
 
     # Cross-market pooled distribution per grid horizon: every market's
     # winsorised h-minute changes, normalised by its level sigma.
@@ -188,21 +197,26 @@ def forecast_case(case):
                 row = [x + z * lev * math.sqrt(h) for z in Z]
             else:
                 target = x * SUM_TARGET / total if total else x
-                a = SUM_STRENGTH_DOWN if target < x else SUM_STRENGTH_UP
-                med = x + a * (1 - math.exp(-h / SUM_TAU)) * (target - x)
-                own_q = interp_grid(inf['own'], h)
-                pool_q = interp_grid(pooled, h)
-                pool_o05 = pool_q[0] * lev
-                pool_o95 = pool_q[4] * lev
-                o05 = (1 - POOL_B) * own_q[0] + POOL_B * pool_o05
-                o95 = (1 - POOL_B) * own_q[4] + POOL_B * pool_o95
-                o05 *= inf['r']
-                o95 *= inf['r']
-                o05 *= OUTER_Q05_SCALE
-                normal_half = 0.67449 * inf['adapt'] * math.sqrt(h) * inf['r']
-                inner_down = (1 - POOL_INNER) * normal_half + POOL_INNER * (-pool_q[1] * lev)
-                inner_up = (1 - POOL_INNER) * normal_half + POOL_INNER * (pool_q[3] * lev)
-                row = [med + o05, med - inner_down, med, med + inner_up, med + o95]
+                if abs(inf['d120']) <= GATE_D120:
+                    med = x
+                else:
+                    med = x + SUM_STRENGTH_ACTIVE * (1 - math.exp(-h / SUM_TAU)) * (target - x)
+                if inf['dormant']:
+                    row = [med, med, med, med, med]
+                else:
+                    own_q = interp_grid(inf['own'], h)
+                    pool_q = interp_grid(pooled, h)
+                    pool_o05 = pool_q[0] * lev
+                    pool_o95 = pool_q[4] * lev
+                    o05 = (1 - POOL_B) * own_q[0] + POOL_B * pool_o05
+                    o95 = (1 - POOL_B) * own_q[4] + POOL_B * pool_o95
+                    o05 *= inf['r']
+                    o95 *= inf['r']
+                    o05 *= OUTER_Q05_SCALE
+                    normal_half = 0.67449 * inf['adapt'] * math.sqrt(h) * inf['r']
+                    inner_down = (1 - POOL_INNER) * normal_half + POOL_INNER * (-pool_q[1] * lev)
+                    inner_up = (1 - POOL_INNER) * normal_half + POOL_INNER * (pool_q[3] * lev)
+                    row = [med + o05, med - inner_down, med, med + inner_up, med + o95]
             row = [round6(v) for v in row]
             for i in range(1, 5):
                 if row[i] < row[i - 1]:
