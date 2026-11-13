@@ -28,7 +28,7 @@ level shifts in the two jumpy cases (oracle-median analysis); no honest
 median variant tested beats persistence + sum-pull. See RESEARCH_R2.md.
 
 Standard library only, no network, no randomness, no wall clock:
-two runs on the same input are byte-identical.
+two runs on the same input are byte-identical. Entry v2 (nvidia-ceo-r2).
 """
 
 import json
