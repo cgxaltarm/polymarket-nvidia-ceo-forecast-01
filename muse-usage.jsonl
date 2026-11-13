@@ -1,3 +1,3 @@
-{"agent_id": "1401fc93-cfba-4d90-9bb3-090152d5c930", "created_at": 1794566554, "input_tokens": 3175167, "message_id": "20992310-99b1-41f5-a3b7-92eec845e5b8", "model": "ipnext/avocado-5.17-v2", "output_tokens": 28651}
-{"agent_id": "a62454ac-11bd-45f0-922f-3898518b4288", "created_at": 1794566554, "input_tokens": 91218, "message_id": "fb01248c-7143-46cf-843a-d6eabea204a2", "model": "ipnext/avocado-5.17-v2", "output_tokens": 430}
-{"agent_id": "9e3884ef-1f7b-4c3c-969f-8c4d89d3fc65", "created_at": 1794566024, "input_tokens": 8454640, "message_id": "bdfd53cb-8e1a-475d-8706-4905c3ed8266", "model": "ipnext/avocado-5.17-v2", "output_tokens": 66407}
+{"agent_id": "7436bd41-ea9c-405b-870f-2fd5f124d63f", "created_at": 1794567960, "input_tokens": 2269465, "message_id": "15cb5a53-afcc-4dea-a4ed-5020d366ce90", "model": "ipnext/avocado-5.17-v2", "output_tokens": 10311}
+{"agent_id": "295ab05e-b9c9-4068-8b2c-d611a8fce8f1", "created_at": 1794567959, "input_tokens": 91158, "message_id": "7fe44042-8ac9-4555-b4c8-3fefd8ac68b6", "model": "ipnext/avocado-5.17-v2", "output_tokens": 269}
+{"agent_id": "7cd522ed-52f8-4a7e-a794-83f20fbd35c7", "created_at": 1794567625, "input_tokens": 6845015, "message_id": "685bb38a-28c4-470f-9e6a-94b9f1cec6f0", "model": "ipnext/avocado-5.17-v2", "output_tokens": 58021}
