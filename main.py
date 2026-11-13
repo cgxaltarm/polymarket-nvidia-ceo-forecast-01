@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polymarket next-CEO-of-NVIDIA forecaster — round-3 candidate (r3).
+"""Entry v3 (nvidia-ceo-r3) — Polymarket next-CEO-of-NVIDIA forecaster, round-3 candidate.
 
 Design (validated in scratch-nvidia-r3, see RESEARCH_R3.md). Builds on r2
 (scratch-nvidia-r2/main.py); the new parts are the REGIME scaling and the
